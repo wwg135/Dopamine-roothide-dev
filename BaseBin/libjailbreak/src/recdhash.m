@@ -4,6 +4,7 @@
 #include <choma/Host.h>
 #include <choma/MachOByteOrder.h>
 #include <choma/CodeDirectory.h>
+#include <sys/param.h>
 #include "log.h"
 
 extern CS_DecodedBlob *csd_superblob_find_best_code_directory(CS_DecodedSuperBlob *decodedSuperblob);
@@ -55,7 +56,7 @@ bool csd_superblob_is_adhoc_signed(CS_DecodedSuperBlob *superblob)
 
 FAT *fat_init_for_writing(const char *filePath)
 {
-    MemoryStream *stream = file_stream_init_from_path(filePath, 0, FILE_STREAM_SIZE_AUTO, FILE_STREAM_FLAG_WRITABLE | FILE_STREAM_FLAG_AUTO_EXPAND);
+    MemoryStream *stream = file_stream_init_from_path(filePath, 0, FILE_STREAM_SIZE_AUTO, FILE_STREAM_FLAG_WRITABLE);
     if (stream) {
         return fat_init_from_memory_stream(stream);;
     }
@@ -94,6 +95,29 @@ int calc_cdhash(uint8_t *cdBlob, size_t cdBlobSize, uint8_t hashtype, void *cdha
     return 0;
 }
 
+#define APP_PATH_PREFIX "/private/var/containers/Bundle/Application/"
+
+bool is_app_path(const char* path)
+{
+    if(!path) return false;
+
+    char rp[PATH_MAX];
+    if(!realpath(path, rp)) return false;
+
+    if(strncmp(rp, APP_PATH_PREFIX, sizeof(APP_PATH_PREFIX)-1) != 0)
+        return false;
+
+    char* p1 = rp + sizeof(APP_PATH_PREFIX)-1;
+    char* p2 = strchr(p1, '/');
+    if(!p2) return false;
+
+    //is normal app or jailbroken app/daemon?
+    if((p2 - p1) != (sizeof("xxxxxxxx-xxxx-xxxx-yxxx-xxxxxxxxxxxx")-1))
+        return false;
+
+	return true;
+}
+
 int ensure_randomized_cdhash(const char* inputPath, void* cdhashOut)
 {
 	if(access(inputPath, W_OK) != 0)
@@ -113,6 +137,8 @@ int ensure_randomized_cdhash(const char* inputPath, void* cdhashOut)
 
 	__block int foundCount = 0;
     __block uint64_t textsegoffset = 0;
+    __block uint64_t firstsectoffset = 0;
+	__block struct section_64 firstsection={0};
     __block struct segment_command_64 textsegment={0};
     __block struct linkedit_data_command linkedit={0};
 
@@ -125,6 +151,18 @@ int ensure_randomized_cdhash(const char* inputPath, void* cdhashOut)
 
 			textsegoffset = offset;
 			textsegment = *segmentCommand;
+
+			if(segmentCommand->nsects==0) {
+				*stop=true;
+				return;
+			}
+
+			firstsectoffset = textsegoffset + sizeof(*segmentCommand);
+			firstsection = *(struct section_64*)((uint64_t)segmentCommand + sizeof(*segmentCommand));
+			if (strcmp(firstsection.segname, "__TEXT") != 0) {
+				*stop=true;
+				return;
+			}
 			
 			*stop = foundOne;
 			foundOne = true;
@@ -148,7 +186,16 @@ int ensure_randomized_cdhash(const char* inputPath, void* cdhashOut)
 	}
 
     uint64_t* rd = (uint64_t*)&(textsegment.segname[sizeof(textsegment.segname)-sizeof(uint64_t)]);
-    JBLogDebug("__TEXT: %llx,%llx, %016llX\n", textsegoffset, textsegment.fileoff, *rd);
+    uint64_t* rd2 = (uint64_t*)&(firstsection.segname[sizeof(firstsection.segname)-sizeof(uint64_t)]);
+    JBLogDebug("__TEXT: %llx,%llx, %016llX %016llX\n", textsegoffset, textsegment.fileoff, *rd, *rd2);
+
+	bool isAppPath = is_app_path(inputPath);
+	
+	//Ignore removable system apps
+	if(isAppPath && rd==0 && rd2==0) {
+		fat_free(fat);
+        return -1;
+	}
 
     int retval=-1;
 
@@ -175,15 +222,26 @@ int ensure_randomized_cdhash(const char* inputPath, void* cdhashOut)
 		
 		uint64_t jbrand = strtoull(getenv("JBRAND"),NULL,16);
 
-		if(*rd == jbrand) 
+		if(!isAppPath && *rd==0 && *rd2 == jbrand) 
 		{
 			retval = csd_code_directory_calculate_hash(bestCDBlob, cdhashOut);
 			break;
 		}
 
-		*rd = jbrand;
+		if(*rd != 0) //fix it patched on v1.0.8
+		{
+			*rd = 0;
+			if(memory_stream_write(fat->stream, macho->archDescriptor.offset + textsegoffset, sizeof(textsegment), &textsegment) != 0) {
+				break;
+			}
+		}
 
-		if(memory_stream_write(fat->stream, macho->archDescriptor.offset + textsegoffset, sizeof(textsegment), &textsegment) != 0) {
+		if(isAppPath) {
+			*rd2 = 0; //fix removable system apps patched on previous version
+		} else {
+			*rd2 = jbrand;
+		}
+		if(memory_stream_write(fat->stream, macho->archDescriptor.offset + firstsectoffset, sizeof(firstsection), &firstsection) != 0) {
 			break;
 		}
 				
